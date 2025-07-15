@@ -1,6 +1,8 @@
+import csv
 import os
 import sqlite3
 import sys
+from datetime import datetime
 
 import keyboard
 from rich.align import Align
@@ -250,7 +252,7 @@ def create_layout(
     if navigation_mode == "table":
         footer_text = "[dim]↑↓ Navigate tables | → Enter table | Enter to refresh | Ctrl+C to exit[/dim]"
     elif navigation_mode == "data":
-        footer_text = "[dim]↑↓ Navigate/Scroll | PgUp/PgDn Page | ← Back | i Query | Home/End | Ctrl+C exit[/dim]"
+        footer_text = "[dim]↑↓ Navigate/Scroll | PgUp/PgDn Page | ← Back | i Query | e Export CSV | Home/End | Ctrl+C exit[/dim]"
 
     layout["footer"].update(
         Panel(Align(footer_text, align="center"), border_style="dim")
@@ -277,6 +279,54 @@ def execute_query(db_path, table_name, query):
         return columns, data, None
     except sqlite3.Error as e:
         return [], [], str(e)
+
+
+def export_to_csv(db_path, table_name, query=None, filename=None):
+    """Export table data or query results to CSV"""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        if query:
+            # Export custom query results
+            cursor.execute(query)
+            data = cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            export_type = "query"
+        else:
+            # Export full table
+            cursor.execute(f"SELECT * FROM {table_name}")
+            data = cursor.fetchall()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            export_type = "table"
+
+        conn.close()
+
+        # Generate filename if not provided
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if export_type == "query":
+                filename = f"query_export_{timestamp}.csv"
+            else:
+                filename = f"{table_name}_{timestamp}.csv"
+
+        # Write CSV file
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            writer.writerow(columns)
+            
+            # Write data rows
+            for row in data:
+                # Convert None values to empty strings
+                csv_row = ['' if val is None else str(val) for val in row]
+                writer.writerow(csv_row)
+
+        return filename, len(data)
+    except Exception as e:
+        return None, str(e)
 
 
 def main():
@@ -458,6 +508,16 @@ def main():
                                 elif event.name == "i":
                                     query_mode = True
                                     query_input = ""
+                                elif event.name == "e":
+                                    # Export current view to CSV
+                                    table_name = tables[selected_table_idx]
+                                    filename, result = export_to_csv(
+                                        db_path, table_name, current_query
+                                    )
+                                    if filename:
+                                        console.print(f"\n[green]✓ Exported {result} rows to {filename}[/green]")
+                                    else:
+                                        console.print(f"\n[red]✗ Export failed: {result}[/red]")
                                 elif event.name == "enter":
                                     # Refresh the current table display
                                     selected_row_idx = 0
