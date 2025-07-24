@@ -2,6 +2,7 @@ mod database;
 mod file_reader;
 mod data_source;
 mod ui;
+mod config;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -22,6 +23,7 @@ use std::{
 
 use data_source::DataSource;
 use ui::{AppState, NavigationMode, render_ui};
+use config::{load_config, Theme};
 
 #[derive(Parser)]
 #[command(name = "sqbrowser")]
@@ -33,6 +35,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Load configuration
+    let config = load_config().context("Failed to load configuration")?;
+    let theme = Theme::from(&config.colors);
 
     // Verify file exists
     if !args.file.exists() {
@@ -68,7 +74,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the application
-    let result = run_app(&mut terminal, &mut app, &data_source);
+    let result = run_app(&mut terminal, &mut app, &data_source, &theme);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -91,13 +97,14 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut AppState,
     data_source: &DataSource,
+    theme: &Theme,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(100);
 
     loop {
         // Draw UI
-        terminal.draw(|f| render_ui(f, app))?;
+        terminal.draw(|f| render_ui(f, app, theme))?;
 
         // Handle events
         let timeout = tick_rate

@@ -11,6 +11,7 @@ use arboard::Clipboard;
 
 use crate::data_source::DataSource;
 use crate::database::QueryResult;
+use crate::config::Theme;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavigationMode {
@@ -20,6 +21,7 @@ pub enum NavigationMode {
     Edit,
     DetailedView,
     ErrorDisplay,
+    ComputedColumn,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +30,19 @@ enum MoveTo {
     Down,
     Left,
     Right,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputedColumn {
+    pub name: String,
+    pub expression: String,
+    pub column_type: ComputedColumnType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComputedColumnType {
+    Aggregate(String), // sum, mean, count, etc.
+    RowOperation(Vec<String>), // operations on individual rows like Age + Height
 }
 
 pub struct AppState {
@@ -53,6 +68,8 @@ pub struct AppState {
     pub clipboard: Option<Clipboard>, // Persistent clipboard state
     pub error_message: Option<String>, // Error message to display
     pub previous_navigation_mode: NavigationMode, // Previous mode before error display
+    pub computed_column_input: String, // Input for computed column expression
+    pub computed_columns: Vec<ComputedColumn>, // List of computed columns
 }
 
 impl AppState {
@@ -80,6 +97,8 @@ impl AppState {
             clipboard: None,
             error_message: None,
             previous_navigation_mode: NavigationMode::Data,
+            computed_column_input: String::new(),
+            computed_columns: Vec::new(),
         }
     }
 
@@ -95,6 +114,7 @@ impl AppState {
             NavigationMode::Edit => self.handle_edit_mode(key_event, data_source),
             NavigationMode::DetailedView => self.handle_detailed_view(key_event, data_source),
             NavigationMode::ErrorDisplay => self.handle_error_display(key_event, data_source),
+            NavigationMode::ComputedColumn => self.handle_computed_column_input(key_event, data_source),
         }
     }
 
@@ -203,6 +223,11 @@ impl AppState {
                     let min_col = if !data.columns.is_empty() && data.columns[0] == "rowid" { 1 } else { 0 };
                     if self.selected_col_idx > min_col {
                         self.selected_col_idx -= 1;
+                    } else {
+                        // Go back to table view when at first column
+                        self.navigation_mode = NavigationMode::Table;
+                        self.reset_data_view();
+                        self.load_current_data(data_source)?;
                     }
                 } else {
                     self.navigation_mode = NavigationMode::Table;
@@ -260,14 +285,30 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::Tab => {
-                self.navigation_mode = NavigationMode::Table;
-                self.reset_data_view();
-                self.load_current_data(data_source)?;
+            KeyCode::Char('n') => {
+                // Add new row
+                if let Some(data) = &mut self.current_data {
+                    let mut new_row: Vec<String> = data.columns.iter().map(|_| String::new()).collect();
+                    // Set rowid to empty for new rows (will be handled by INSERT)
+                    if !data.columns.is_empty() && data.columns[0] == "rowid" {
+                        new_row[0] = String::new();
+                    }
+                    
+                    data.rows.push(new_row);
+                    data.total_rows += 1;
+                    self.data_modified = true;
+                    self.selected_row_idx = data.rows.len() - 1;
+                    self.selected_col_idx = if data.columns.is_empty() || data.columns[0] != "rowid" { 0 } else { 1 };
+                    self.status_message = Some("New row added".to_string());
+                }
             }
             KeyCode::Char('i') => {
                 self.navigation_mode = NavigationMode::Query;
                 self.query_input.clear();
+            }
+            KeyCode::Char(':') => {
+                self.navigation_mode = NavigationMode::ComputedColumn;
+                self.computed_column_input.clear();
             }
             KeyCode::Char('e') => {
                 self.export_to_csv(data_source)?;
@@ -331,6 +372,11 @@ impl AppState {
                 self.navigation_mode = NavigationMode::Data;
                 self.editing_cell = None;
                 self.edit_input.clear();
+                
+                // Refresh computed columns after edit
+                if let Err(e) = self.refresh_computed_columns() {
+                    self.show_error(format!("Failed to update computed columns: {}", e));
+                }
             }
             KeyCode::Up => {
                 self.save_current_edit_and_move_to(MoveTo::Up, data_source)?;
@@ -514,6 +560,9 @@ impl AppState {
             self.original_data = Some(result.clone());
             self.current_data = Some(result);
             
+            // Apply computed columns to the loaded data
+            self.apply_computed_columns(data_source)?;
+            
             // Ensure column selection is valid (skip rowid)
             self.ensure_valid_col_selection();
         }
@@ -681,9 +730,339 @@ impl AppState {
         Ok(true)
     }
 
+    fn handle_computed_column_input(&mut self, key_event: KeyEvent, data_source: &DataSource) -> Result<bool> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.navigation_mode = NavigationMode::Data;
+                self.computed_column_input.clear();
+            }
+            KeyCode::Enter => {
+                if !self.computed_column_input.trim().is_empty() {
+                    match self.parse_and_add_computed_column(&self.computed_column_input.clone()) {
+                        Ok(_) => {
+                            self.apply_computed_columns(data_source)?;
+                            self.status_message = Some("Computed column added".to_string());
+                        }
+                        Err(e) => {
+                            self.show_error(format!("Expression error: {}", e));
+                        }
+                    }
+                }
+                self.navigation_mode = NavigationMode::Data;
+                self.computed_column_input.clear();
+            }
+            KeyCode::Backspace => {
+                self.computed_column_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.computed_column_input.push(c);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn parse_and_add_computed_column(&mut self, expression: &str) -> Result<()> {
+        let expression = expression.trim();
+        
+        // Parse different types of expressions
+        if let Some(captures) = regex::Regex::new(r"^(sum|mean|count|min|max)\(([^)]+)\)$")
+            .unwrap()
+            .captures(expression) {
+            // Aggregate function
+            let func = captures.get(1).unwrap().as_str();
+            let column = captures.get(2).unwrap().as_str().trim();
+            
+            // Verify column exists
+            if let Some(data) = &self.current_data {
+                if !data.columns.contains(&column.to_string()) {
+                    return Err(anyhow::anyhow!("Column '{}' does not exist", column));
+                }
+            }
+            
+            let computed_col = ComputedColumn {
+                name: format!("{}({})", func, column),
+                expression: expression.to_string(),
+                column_type: ComputedColumnType::Aggregate(func.to_string()),
+            };
+            
+            self.computed_columns.push(computed_col);
+            Ok(())
+        } else if expression.contains('+') || expression.contains('-') || expression.contains('*') || expression.contains('/') {
+            // Row operation
+            let columns_used = self.extract_column_names(expression)?;
+            
+            // Verify all columns exist
+            if let Some(data) = &self.current_data {
+                for col in &columns_used {
+                    if !data.columns.contains(col) {
+                        return Err(anyhow::anyhow!("Column '{}' does not exist", col));
+                    }
+                }
+            }
+            
+            let computed_col = ComputedColumn {
+                name: expression.to_string(),
+                expression: expression.to_string(),
+                column_type: ComputedColumnType::RowOperation(columns_used),
+            };
+            
+            self.computed_columns.push(computed_col);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Invalid expression format. Use sum(Column), mean(Column), or Column1 + Column2"))
+        }
+    }
+    
+    fn extract_column_names(&self, expression: &str) -> Result<Vec<String>> {
+        let mut columns = Vec::new();
+        let mut current_token = String::new();
+        let mut in_column = false;
+        
+        for ch in expression.chars() {
+            match ch {
+                '+' | '-' | '*' | '/' | '(' | ')' | ' ' => {
+                    if in_column && !current_token.trim().is_empty() {
+                        columns.push(current_token.trim().to_string());
+                        current_token.clear();
+                        in_column = false;
+                    }
+                }
+                _ => {
+                    if !in_column && !ch.is_whitespace() {
+                        in_column = true;
+                    }
+                    if in_column {
+                        current_token.push(ch);
+                    }
+                }
+            }
+        }
+        
+        if in_column && !current_token.trim().is_empty() {
+            columns.push(current_token.trim().to_string());
+        }
+        
+        // Filter out numeric literals
+        columns.retain(|col| !col.parse::<f64>().is_ok());
+        
+        Ok(columns)
+    }
+    
+    fn apply_computed_columns(&mut self, _data_source: &DataSource) -> Result<()> {
+        if let Some(data) = &mut self.current_data {
+            for computed_col in &self.computed_columns {
+                // Check if column already exists, if so, remove it first
+                if let Some(pos) = data.columns.iter().position(|x| x == &computed_col.name) {
+                    data.columns.remove(pos);
+                    for row in &mut data.rows {
+                        if pos < row.len() {
+                            row.remove(pos);
+                        }
+                    }
+                }
+                
+                // Add the new computed column
+                data.columns.push(computed_col.name.clone());
+                
+                match &computed_col.column_type {
+                    ComputedColumnType::Aggregate(func) => {
+                        let value = Self::compute_aggregate_static(data, func, &computed_col.expression)?;
+                        for row in &mut data.rows {
+                            row.push(value.clone());
+                        }
+                    }
+                    ComputedColumnType::RowOperation(columns_used) => {
+                        let expression = computed_col.expression.clone();
+                        let cols = columns_used.clone();
+                        let mut computed_values = Vec::new();
+                        
+                        for row in &data.rows {
+                            let value = Self::compute_row_operation_static(data, row, &expression, &cols)?;
+                            computed_values.push(value);
+                        }
+                        
+                        for (row, value) in data.rows.iter_mut().zip(computed_values) {
+                            row.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn compute_aggregate_static(data: &QueryResult, func: &str, expression: &str) -> Result<String> {
+        // Extract column name from expression like "sum(Age)"
+        let column_name = expression
+            .trim_start_matches(func)
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+            
+        let col_idx = data.columns.iter().position(|col| col == column_name)
+            .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", column_name))?;
+        
+        let mut values = Vec::new();
+        for row in &data.rows {
+            if col_idx < row.len() {
+                if let Ok(val) = row[col_idx].parse::<f64>() {
+                    values.push(val);
+                }
+            }
+        }
+        
+        if values.is_empty() {
+            return Ok("0".to_string());
+        }
+        
+        let result = match func {
+            "sum" => values.iter().sum::<f64>(),
+            "mean" => values.iter().sum::<f64>() / values.len() as f64,
+            "count" => values.len() as f64,
+            "min" => values.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            "max" => values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+            _ => return Err(anyhow::anyhow!("Unknown function: {}", func)),
+        };
+        
+        Ok(if result.fract() == 0.0 {
+            format!("{:.0}", result)
+        } else {
+            format!("{:.2}", result)
+        })
+    }
+    
+    fn compute_row_operation_static(data: &QueryResult, row: &[String], expression: &str, columns_used: &[String]) -> Result<String> {
+        let mut expr = expression.to_string();
+        
+        // Replace column names with their values
+        for col_name in columns_used {
+            if let Some(col_idx) = data.columns.iter().position(|col| col == col_name) {
+                if col_idx < row.len() {
+                    let value = row[col_idx].parse::<f64>().unwrap_or(0.0);
+                    expr = expr.replace(col_name, &value.to_string());
+                }
+            }
+        }
+        
+        // Simple expression evaluator for basic math operations
+        Self::evaluate_expression_static(&expr)
+    }
+    
+    fn evaluate_expression_static(expr: &str) -> Result<String> {
+        // Simple evaluator for basic arithmetic
+        // This is a simplified version - for production, you'd want a proper expression parser
+        let expr = expr.replace(" ", "");
+        
+        // Handle simple addition/subtraction first
+        if let Some(pos) = expr.rfind('+') {
+            let left = Self::evaluate_expression_static(&expr[..pos])?;
+            let right = Self::evaluate_expression_static(&expr[pos+1..])?;
+            let result = left.parse::<f64>()? + right.parse::<f64>()?;
+            return Ok(if result.fract() == 0.0 {
+                format!("{:.0}", result)
+            } else {
+                format!("{:.2}", result)
+            });
+        }
+        
+        if let Some(pos) = expr.rfind('-') {
+            let left = Self::evaluate_expression_static(&expr[..pos])?;
+            let right = Self::evaluate_expression_static(&expr[pos+1..])?;
+            let result = left.parse::<f64>()? - right.parse::<f64>()?;
+            return Ok(if result.fract() == 0.0 {
+                format!("{:.0}", result)
+            } else {
+                format!("{:.2}", result)
+            });
+        }
+        
+        // Handle multiplication/division
+        if let Some(pos) = expr.rfind('*') {
+            let left = Self::evaluate_expression_static(&expr[..pos])?;
+            let right = Self::evaluate_expression_static(&expr[pos+1..])?;
+            let result = left.parse::<f64>()? * right.parse::<f64>()?;
+            return Ok(if result.fract() == 0.0 {
+                format!("{:.0}", result)
+            } else {
+                format!("{:.2}", result)
+            });
+        }
+        
+        if let Some(pos) = expr.rfind('/') {
+            let left = Self::evaluate_expression_static(&expr[..pos])?;
+            let right = Self::evaluate_expression_static(&expr[pos+1..])?;
+            let right_val = right.parse::<f64>()?;
+            if right_val == 0.0 {
+                return Err(anyhow::anyhow!("Division by zero"));
+            }
+            let result = left.parse::<f64>()? / right_val;
+            return Ok(if result.fract() == 0.0 {
+                format!("{:.0}", result)
+            } else {
+                format!("{:.2}", result)
+            });
+        }
+        
+        // Base case - just a number
+        Ok(expr.to_string())
+    }
+    
+    fn refresh_computed_columns(&mut self) -> Result<()> {
+        if let Some(data) = &mut self.current_data {
+            // Remove all computed columns first
+            let mut cols_to_remove = Vec::new();
+            for computed_col in &self.computed_columns {
+                if let Some(pos) = data.columns.iter().position(|x| x == &computed_col.name) {
+                    cols_to_remove.push(pos);
+                }
+            }
+            
+            // Remove in reverse order to maintain indices
+            cols_to_remove.sort_by(|a, b| b.cmp(a));
+            for pos in cols_to_remove {
+                data.columns.remove(pos);
+                for row in &mut data.rows {
+                    if pos < row.len() {
+                        row.remove(pos);
+                    }
+                }
+            }
+            
+            // Re-apply all computed columns
+            for computed_col in &self.computed_columns {
+                data.columns.push(computed_col.name.clone());
+                
+                match &computed_col.column_type {
+                    ComputedColumnType::Aggregate(func) => {
+                        let value = Self::compute_aggregate_static(data, func, &computed_col.expression)?;
+                        for row in &mut data.rows {
+                            row.push(value.clone());
+                        }
+                    }
+                    ComputedColumnType::RowOperation(columns_used) => {
+                        let expression = computed_col.expression.clone();
+                        let cols = columns_used.clone();
+                        let mut computed_values = Vec::new();
+                        
+                        for row in &data.rows {
+                            let value = Self::compute_row_operation_static(data, row, &expression, &cols)?;
+                            computed_values.push(value);
+                        }
+                        
+                        for (row, value) in data.rows.iter_mut().zip(computed_values) {
+                            row.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
 }
 
-pub fn render_ui(frame: &mut Frame, app: &AppState) {
+pub fn render_ui(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -699,9 +1078,9 @@ pub fn render_ui(frame: &mut Frame, app: &AppState) {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown")))
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(theme.header).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green)));
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.header)));
     frame.render_widget(header, chunks[0]);
 
     // Body
@@ -714,51 +1093,56 @@ pub fn render_ui(frame: &mut Frame, app: &AppState) {
         .split(chunks[1]);
 
     // Render sidebar (tables list)
-    render_sidebar(frame, app, body_chunks[0]);
+    render_sidebar(frame, app, body_chunks[0], theme);
     
     // Render main area
-    render_main_area(frame, app, body_chunks[1]);
+    render_main_area(frame, app, body_chunks[1], theme);
 
     // Query input overlay
     if app.navigation_mode == NavigationMode::Query {
-        render_query_input(frame, app);
+        render_query_input(frame, app, theme);
     }
 
     // Edit input overlay
     if app.navigation_mode == NavigationMode::Edit {
-        render_edit_input(frame, app);
+        render_edit_input(frame, app, theme);
+    }
+
+    // Computed column input overlay
+    if app.navigation_mode == NavigationMode::ComputedColumn {
+        render_computed_column_input(frame, app, theme);
     }
 
     // Help overlay
     if app.show_help {
-        render_help(frame);
+        render_help(frame, theme);
     }
 
     // Detailed view overlay
     if app.navigation_mode == NavigationMode::DetailedView {
-        render_detailed_view(frame, app);
+        render_detailed_view(frame, app, theme);
     }
 
     // Error display overlay
     if app.navigation_mode == NavigationMode::ErrorDisplay {
-        render_error_display(frame, app);
+        render_error_display(frame, app, theme);
     }
 
     // Footer
-    render_footer(frame, app, chunks[2]);
+    render_footer(frame, app, chunks[2], theme);
 }
 
-fn render_sidebar(frame: &mut Frame, app: &AppState, area: Rect) {
+fn render_sidebar(frame: &mut Frame, app: &AppState, area: Rect, theme: &Theme) {
     let border_style = if app.navigation_mode == NavigationMode::Table {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme.selected_border)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border)
     };
 
     let title_style = if app.navigation_mode == NavigationMode::Table {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.selected_border).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.border).add_modifier(Modifier::BOLD)
     };
 
     let sidebar_title = if app.db_path.ends_with(".xlsx") || app.db_path.ends_with(".xls") {
@@ -774,12 +1158,12 @@ fn render_sidebar(frame: &mut Frame, app: &AppState, area: Rect) {
     let items: Vec<Line> = app.tables.iter().enumerate().map(|(i, table)| {
         if i == app.selected_table_idx {
             if app.navigation_mode == NavigationMode::Table {
-                Line::from(Span::styled(format!("▶ {}", table), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+                Line::from(Span::styled(format!("▶ {}", table), Style::default().fg(theme.selected_border).add_modifier(Modifier::BOLD)))
             } else {
                 Line::from(Span::styled(format!("▶ {}", table), Style::default().fg(Color::DarkGray)))
             }
         } else {
-            Line::from(Span::raw(format!("  {}", table)))
+            Line::from(Span::styled(format!("  {}", table), Style::default().fg(theme.text)))
         }
     }).collect();
 
@@ -792,7 +1176,7 @@ fn render_sidebar(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(list, area);
 }
 
-fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect) {
+fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect, theme: &Theme) {
     if app.tables.is_empty() || app.selected_table_idx >= app.tables.len() {
         let placeholder = Paragraph::new("Select a table to view its contents")
             .style(Style::default().fg(Color::DarkGray))
@@ -800,21 +1184,21 @@ fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect) {
             .block(Block::default()
                 .borders(Borders::ALL)
                 .title("Table Contents")
-                .border_style(Style::default().fg(Color::Green)));
+                .border_style(Style::default().fg(theme.border)));
         frame.render_widget(placeholder, area);
         return;
     }
 
     let border_style = match app.navigation_mode {
-        NavigationMode::Data => Style::default().fg(Color::Yellow),
-        NavigationMode::Edit => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::Green),
+        NavigationMode::Data => Style::default().fg(theme.selected_border),
+        NavigationMode::Edit => Style::default().fg(theme.edit_border),
+        _ => Style::default().fg(theme.border),
     };
 
     let title_style = match app.navigation_mode {
-        NavigationMode::Data => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        NavigationMode::Edit => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        NavigationMode::Data => Style::default().fg(theme.selected_border).add_modifier(Modifier::BOLD),
+        NavigationMode::Edit => Style::default().fg(theme.edit_border).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(theme.border).add_modifier(Modifier::BOLD),
     };
 
     if let Some(data) = &app.current_data {
@@ -863,20 +1247,16 @@ fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect) {
                 if (app.navigation_mode == NavigationMode::Edit || app.navigation_mode == NavigationMode::Data) 
                     && i == app.selected_row_idx && actual_col_idx == app.selected_col_idx {
                     if app.navigation_mode == NavigationMode::Edit {
-                        Cell::from(content).style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        Cell::from(content).style(Style::default().fg(theme.edit_text).bg(theme.edit_bg).add_modifier(Modifier::BOLD))
                     } else {
-                        Cell::from(content).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        Cell::from(content).style(Style::default().fg(theme.selected_text).bg(theme.selected_bg).add_modifier(Modifier::BOLD))
                     }
                 } else {
-                    Cell::from(content)
+                    Cell::from(content).style(Style::default().fg(theme.text))
                 }
             }).collect();
 
-            if app.navigation_mode == NavigationMode::Data && i == app.selected_row_idx {
-                Row::new(cells).style(Style::default().fg(Color::Yellow))
-            } else {
-                Row::new(cells)
-            }
+            Row::new(cells)
         }).collect();
 
         // Create column widths (for display columns only)
@@ -898,13 +1278,20 @@ fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect) {
         
         let table = Table::new(rows, widths)
             .header(Row::new(display_columns.iter().map(|h| {
-                Cell::from(h.as_str()).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                // Check if this is a computed column
+                let is_computed = app.computed_columns.iter().any(|col| &col.name == h);
+                if is_computed {
+                    let header_text = format!("*{}", h);
+                    Cell::from(header_text).style(Style::default().fg(theme.number).add_modifier(Modifier::BOLD))
+                } else {
+                    Cell::from(h.as_str()).style(Style::default().fg(theme.help).add_modifier(Modifier::BOLD))
+                }
             }).collect::<Vec<_>>()))
             .block(Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(title, title_style))
                 .border_style(border_style))
-            .style(Style::default().fg(Color::Cyan));
+            .style(Style::default().fg(theme.text));
 
         frame.render_widget(table, area);
     } else {
@@ -919,7 +1306,7 @@ fn render_main_area(frame: &mut Frame, app: &AppState, area: Rect) {
     }
 }
 
-fn render_query_input(frame: &mut Frame, app: &AppState) {
+fn render_query_input(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let area = frame.area();
     let popup_area = Rect {
         x: area.width / 6,
@@ -932,17 +1319,17 @@ fn render_query_input(frame: &mut Frame, app: &AppState) {
     frame.render_widget(Clear, popup_area);
 
     let query_input = Paragraph::new(format!("{}_", app.query_input))
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(Style::default().fg(theme.text).bg(Color::Black))
         .block(Block::default()
             .borders(Borders::ALL)
             .title("Enter SQL Query (ESC to cancel)")
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(Color::Black)));
 
     frame.render_widget(query_input, popup_area);
 }
 
-fn render_edit_input(frame: &mut Frame, app: &AppState) {
+fn render_edit_input(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let area = frame.area();
     let popup_area = Rect {
         x: area.width / 6,
@@ -955,16 +1342,39 @@ fn render_edit_input(frame: &mut Frame, app: &AppState) {
     frame.render_widget(Clear, popup_area);
 
     let edit_input = Paragraph::new(format!("{}_", app.edit_input))
-        .style(Style::default().fg(Color::Black).bg(Color::White))
+        .style(Style::default().fg(theme.edit_text).bg(Color::White))
         .block(Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(theme.edit_border))
             .style(Style::default().bg(Color::White)));
 
     frame.render_widget(edit_input, popup_area);
 }
 
-fn render_detailed_view(frame: &mut Frame, app: &AppState) {
+fn render_computed_column_input(frame: &mut Frame, app: &AppState, theme: &Theme) {
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 2 - 2,
+        width: area.width * 2 / 3,
+        height: 5,
+    };
+
+    // Clear the background area first
+    frame.render_widget(Clear, popup_area);
+
+    let computed_col_input = Paragraph::new(format!("{}_", app.computed_column_input))
+        .style(Style::default().fg(theme.text).bg(Color::Black))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Computed Column (e.g., sum(Age), Age + Height)")
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(Color::Black)));
+
+    frame.render_widget(computed_col_input, popup_area);
+}
+
+fn render_detailed_view(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let area = frame.area();
     let popup_area = Rect {
         x: area.width / 8,
@@ -998,15 +1408,15 @@ fn render_detailed_view(frame: &mut Frame, app: &AppState) {
                     let is_selected = i == app.detailed_view_selected_field;
                     
                     let field_style = if is_selected {
-                        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme.selected_text).bg(theme.selected_bg).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme.help).add_modifier(Modifier::BOLD)
                     };
                     
                     let value_style = if is_selected {
-                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                        Style::default().fg(theme.selected_text).bg(theme.selected_bg)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(theme.text)
                     };
                     
                     lines.push(Line::from(vec![
@@ -1027,9 +1437,9 @@ fn render_detailed_view(frame: &mut Frame, app: &AppState) {
                     .block(Block::default()
                         .borders(Borders::ALL)
                         .title("Detailed View")
-                        .border_style(Style::default().fg(Color::Yellow))
+                        .border_style(Style::default().fg(theme.selected_border))
                         .style(Style::default().bg(Color::Black)))
-                    .style(Style::default().fg(Color::White).bg(Color::Black))
+                    .style(Style::default().fg(theme.text).bg(Color::Black))
                     .wrap(ratatui::widgets::Wrap { trim: false });
 
                 frame.render_widget(detailed_view, popup_area);
@@ -1038,7 +1448,7 @@ fn render_detailed_view(frame: &mut Frame, app: &AppState) {
     }
 }
 
-fn render_error_display(frame: &mut Frame, app: &AppState) {
+fn render_error_display(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let area = frame.area();
     let popup_area = Rect {
         x: area.width / 6,
@@ -1052,9 +1462,9 @@ fn render_error_display(frame: &mut Frame, app: &AppState) {
 
     if let Some(error_msg) = &app.error_message {
         let lines = vec![
-            Line::from(Span::styled("Error", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Error", Style::default().fg(theme.error).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from(Span::styled(error_msg, Style::default().fg(Color::White))),
+            Line::from(Span::styled(error_msg, Style::default().fg(theme.text))),
             Line::from(""),
             Line::from(Span::styled("Press ESC to close", Style::default().fg(Color::DarkGray))),
         ];
@@ -1063,9 +1473,9 @@ fn render_error_display(frame: &mut Frame, app: &AppState) {
             .block(Block::default()
                 .borders(Borders::ALL)
                 .title("Error")
-                .border_style(Style::default().fg(Color::Red))
+                .border_style(Style::default().fg(theme.error))
                 .style(Style::default().bg(Color::Black)))
-            .style(Style::default().fg(Color::White).bg(Color::Black))
+            .style(Style::default().fg(theme.text).bg(Color::Black))
             .alignment(Alignment::Center)
             .wrap(ratatui::widgets::Wrap { trim: false });
 
@@ -1073,7 +1483,7 @@ fn render_error_display(frame: &mut Frame, app: &AppState) {
     }
 }
 
-fn render_help(frame: &mut Frame) {
+fn render_help(frame: &mut Frame, theme: &Theme) {
     let area = frame.area();
     let popup_area = Rect {
         x: area.width / 8,
@@ -1083,30 +1493,32 @@ fn render_help(frame: &mut Frame) {
     };
 
     let help_text = vec![
-        Line::from(Span::styled("SQLite Browser - Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("SQLite Browser - Help", Style::default().fg(theme.selected_border).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(Span::styled("Table Navigation Mode:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Table Navigation Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
         Line::from("  ↑↓      Navigate tables"),
         Line::from("  →/Enter Enter table data view"),
         Line::from("  h       Toggle this help"),
         Line::from("  Ctrl+C  Exit application"),
         Line::from(""),
-        Line::from(Span::styled("Data Navigation Mode:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Data Navigation Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
         Line::from("  ↑↓←→    Navigate rows and columns"),
+        Line::from("  ←       Back to table list (when at first column)"),
         Line::from("  Space   Enter edit mode for selected cell"),
         Line::from("  Enter   Show detailed view for selected row"),
+        Line::from("  n       Add new row"),
         Line::from("  PgUp/Dn Page navigation"),
         Line::from("  Home    Go to first page"),
         Line::from("  End     Go to last page"),
-        Line::from("  Tab     Back to table/sheet list"),
         Line::from("  i       Enter query mode (SQLite only)"),
+        Line::from("  :       Add computed column (sum(Col), Col1 + Col2)"),
         Line::from("  e       Export to CSV"),
         Line::from("  s       Save changes"),
         Line::from("  r       Refresh data"),
         Line::from("  h       Toggle this help"),
         Line::from("  Ctrl+C  Exit application"),
         Line::from(""),
-        Line::from(Span::styled("Edit Mode:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Edit Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
         Line::from("  Type    Edit cell content"),
         Line::from("  ↑↓←→    Navigate between cells while editing"),
         Line::from("  Enter   Save changes and exit edit mode"),
@@ -1114,15 +1526,21 @@ fn render_help(frame: &mut Frame) {
         Line::from("  Ctrl+N  Add new row"),
         Line::from("  ESC     Cancel edit"),
         Line::from(""),
-        Line::from(Span::styled("Query Mode:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Query Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
         Line::from("  Type your SQL query"),
         Line::from("  Enter   Execute query"),
         Line::from("  ESC     Cancel query"),
         Line::from(""),
-        Line::from(Span::styled("Detailed View Mode:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Detailed View Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
         Line::from("  ↑↓      Navigate between fields"),
         Line::from("  c       Copy selected field value to clipboard"),
         Line::from("  ESC     Close detailed view"),
+        Line::from(""),
+        Line::from(Span::styled("Computed Column Mode:", Style::default().fg(theme.header).add_modifier(Modifier::BOLD))),
+        Line::from("  Type expression like sum(Age), mean(Height), Age + Height"),
+        Line::from("  Supported: sum, mean, count, min, max, +, -, *, /"),
+        Line::from("  Enter   Add computed column"),
+        Line::from("  ESC     Cancel"),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
     ];
@@ -1134,32 +1552,33 @@ fn render_help(frame: &mut Frame) {
         .block(Block::default()
             .borders(Borders::ALL)
             .title("Help")
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(theme.selected_border))
             .style(Style::default().bg(Color::Black)))
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(theme.text).bg(Color::Black));
 
     frame.render_widget(help, popup_area);
 }
 
-fn render_footer(frame: &mut Frame, app: &AppState, area: Rect) {
+fn render_footer(frame: &mut Frame, app: &AppState, area: Rect, theme: &Theme) {
     let footer_text = match app.navigation_mode {
         NavigationMode::Table => "↑↓ Navigate | → Enter | h Help | Ctrl+C Exit",
-        NavigationMode::Data => "↑↓←→ Navigate | Space Edit | Enter Details | PgUp/Dn Page | Tab Back | i Query | e Export | s Save | h Help | Ctrl+C Exit",
+        NavigationMode::Data => "↑↓←→ Navigate | ← Back | Space Edit | Enter Details | n New Row | PgUp/Dn Page | i Query | : Computed | e Export | s Save | h Help | Ctrl+C Exit",
         NavigationMode::Query => "Type query | Enter Execute | ESC Cancel",
         NavigationMode::Edit => "Type to edit | ↑↓←→ Navigate | Enter Save | Tab Next | Ctrl+N New Row | ESC Cancel",
         NavigationMode::DetailedView => "↑↓ Navigate fields | c Copy value | ESC Close",
         NavigationMode::ErrorDisplay => "ESC Close error",
+        NavigationMode::ComputedColumn => "Type expression | Enter Add | ESC Cancel",
     };
 
     let mut footer_content = vec![Line::from(Span::styled(footer_text, Style::default().fg(Color::DarkGray)))];
     
     if let Some(status) = &app.status_message {
-        footer_content.insert(0, Line::from(Span::styled(status, Style::default().fg(Color::Green))));
+        footer_content.insert(0, Line::from(Span::styled(status, Style::default().fg(theme.status))));
     }
 
     let footer = Paragraph::new(footer_content)
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.border)));
     
     frame.render_widget(footer, area);
 }
