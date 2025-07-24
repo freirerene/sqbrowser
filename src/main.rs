@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     }
 
     // Open data source
-    let data_source = DataSource::open(args.file.clone())
+    let mut data_source = DataSource::open(args.file.clone())
         .context("Failed to open file")?;
 
     // Get tables/sheets
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     )?;
 
     // Load initial data
-    app.load_current_data(&data_source)?;
+    app.load_current_data(&mut data_source)?;
 
     // Setup terminal
     enable_raw_mode()?;
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the application
-    let result = run_app(&mut terminal, &mut app, &data_source, &theme);
+    let result = run_app(&mut terminal, &mut app, &mut data_source, &theme);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut AppState,
-    data_source: &DataSource,
+    data_source: &mut DataSource,
     theme: &Theme,
 ) -> Result<()> {
     let mut last_tick = Instant::now();

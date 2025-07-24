@@ -116,7 +116,7 @@ impl AppState {
     pub fn handle_key_event(
         &mut self,
         key_event: KeyEvent,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<bool> {
         // Handle help screen ESC in any mode
         if self.show_help && key_event.code == KeyCode::Esc {
@@ -140,7 +140,7 @@ impl AppState {
     fn handle_query_input(
         &mut self,
         key_event: KeyEvent,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<bool> {
         match key_event.code {
             KeyCode::Esc => {
@@ -192,7 +192,7 @@ impl AppState {
     fn handle_table_navigation(
         &mut self,
         key_event: KeyEvent,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<bool> {
         match key_event.code {
             KeyCode::Up => {
@@ -230,7 +230,7 @@ impl AppState {
     fn handle_data_navigation(
         &mut self,
         key_event: KeyEvent,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<bool> {
         match key_event.code {
             KeyCode::Up => {
@@ -355,7 +355,12 @@ impl AppState {
                     } else {
                         1
                     };
-                    self.status_message = Some("New row added".to_string());
+                    
+                    // Immediately enter edit mode for the first editable cell
+                    self.navigation_mode = NavigationMode::Edit;
+                    self.editing_cell = Some((self.selected_row_idx, self.selected_col_idx));
+                    self.edit_input = String::new(); // Start with empty input for new cell
+                    self.status_message = Some("New row added - editing".to_string());
                 }
             }
             KeyCode::Char('i') => {
@@ -408,7 +413,7 @@ impl AppState {
         Ok(true)
     }
 
-    fn handle_edit_mode(&mut self, key_event: KeyEvent, data_source: &DataSource) -> Result<bool> {
+    fn handle_edit_mode(&mut self, key_event: KeyEvent, data_source: &mut DataSource) -> Result<bool> {
         match key_event.code {
             KeyCode::Esc => {
                 self.navigation_mode = NavigationMode::Data;
@@ -535,7 +540,7 @@ impl AppState {
     fn save_current_edit_and_move_to(
         &mut self,
         direction: MoveTo,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<()> {
         // Save current edit
         if let Some((row_idx, col_idx)) = self.editing_cell {
@@ -638,7 +643,7 @@ impl AppState {
         }
     }
 
-    pub fn load_current_data(&mut self, data_source: &DataSource) -> Result<()> {
+    pub fn load_current_data(&mut self, data_source: &mut DataSource) -> Result<()> {
         if let Some(table_name) = self.current_table().map(|s| s.to_string()) {
             let result = if let Some(query) = &self.current_query {
                 data_source.execute_custom_query(
@@ -656,7 +661,7 @@ impl AppState {
             self.current_data = Some(result);
 
             // Load saved computed columns if available
-            self.load_computed_columns(&table_name)?;
+            self.load_computed_columns(&table_name, data_source)?;
 
             // Apply computed columns to the loaded data
             self.apply_computed_columns(data_source)?;
@@ -667,9 +672,20 @@ impl AppState {
         Ok(())
     }
 
-    fn load_computed_columns(&mut self, table_name: &str) -> Result<()> {
+    fn get_effective_persistence_path(&self, data_source: &DataSource) -> String {
+        // Use the effective save path if available, otherwise fall back to the original db_path
+        if let Some(effective_path) = data_source.get_effective_save_path() {
+            effective_path.to_string_lossy().to_string()
+        } else {
+            self.db_path.clone()
+        }
+    }
+
+    fn load_computed_columns(&mut self, table_name: &str, data_source: &DataSource) -> Result<()> {
+        let effective_path = self.get_effective_persistence_path(data_source);
+        
         // Check if file has changed and recalculation is needed
-        if self.persistence.should_recalculate(&self.db_path) {
+        if self.persistence.should_recalculate(&effective_path) {
             // File has changed, clear computed columns to force user to recreate them
             // This is a safety measure to prevent incorrect calculations
             self.computed_columns.clear();
@@ -678,7 +694,7 @@ impl AppState {
 
         match self
             .persistence
-            .load_computed_columns(&self.db_path, table_name)
+            .load_computed_columns(&effective_path, table_name)
         {
             Ok(columns) => {
                 self.computed_columns = columns;
@@ -691,9 +707,10 @@ impl AppState {
         Ok(())
     }
 
-    fn save_computed_columns(&self, table_name: &str) -> Result<()> {
+    fn save_computed_columns(&self, table_name: &str, data_source: &DataSource) -> Result<()> {
+        let effective_path = self.get_effective_persistence_path(data_source);
         self.persistence
-            .save_computed_columns(&self.db_path, table_name, &self.computed_columns)
+            .save_computed_columns(&effective_path, table_name, &self.computed_columns)
             .context("Failed to save computed columns")?;
         Ok(())
     }
@@ -718,7 +735,7 @@ impl AppState {
         Ok(())
     }
 
-    pub fn save_changes(&mut self, data_source: &DataSource) -> Result<()> {
+    pub fn save_changes(&mut self, data_source: &mut DataSource) -> Result<()> {
         if !self.data_modified {
             self.status_message = Some("No changes to save".to_string());
             return Ok(());
@@ -727,45 +744,52 @@ impl AppState {
         let table_name = self.current_table().map(|s| s.to_string());
         if let Some(table_name) = table_name {
             if let Some(data) = self.current_data.clone() {
-                // For now, we'll only support saving to CSV files
-                // SQLite and Excel would need more complex update logic
-                match data_source {
-                    crate::data_source::DataSource::Csv(_, _) => {
-                        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                        let filename = format!("{}_edited_{}.csv", table_name, timestamp);
-                        self.write_csv_data(&data, &filename)?;
+                match data_source.save_table_data(&table_name, &data) {
+                    Ok(()) => {
                         self.data_modified = false;
-                        self.status_message = Some(format!("Changes saved to {}", filename));
+                        
+                        // Reload the data source to reflect the saved changes
+                        if let Err(e) = data_source.reload_data() {
+                            self.status_message = Some(format!("Save successful but reload failed: {}", e));
+                        } else {
+                            match data_source {
+                                crate::data_source::DataSource::Csv(_, path) => {
+                                    self.status_message = Some(format!("Changes saved to {}", path.display()));
+                                }
+                                crate::data_source::DataSource::Xlsx(_, path) => {
+                                    let csv_path = path.with_extension("csv");
+                                    self.status_message = Some(format!(
+                                        "Changes saved to {} (converted from Excel)", 
+                                        csv_path.display()
+                                    ));
+                                }
+                                crate::data_source::DataSource::Parquet(_, path) => {
+                                    let csv_path = path.with_extension("csv");
+                                    self.status_message = Some(format!(
+                                        "Changes saved to {} (converted from Parquet)", 
+                                        csv_path.display()
+                                    ));
+                                }
+                                crate::data_source::DataSource::Sqlite(_) => {
+                                    self.status_message = Some("SQLite direct save not implemented yet".to_string());
+                                }
+                            }
+                        }
                     }
-                    crate::data_source::DataSource::Xlsx(_) => {
-                        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                        let filename = format!("{}_edited_{}.csv", table_name, timestamp);
-                        self.write_csv_data(&data, &filename)?;
-                        self.data_modified = false;
-                        self.status_message = Some(format!(
-                            "Changes saved to {} (converted from Excel)",
-                            filename
-                        ));
-                    }
-                    crate::data_source::DataSource::Sqlite(_) => {
-                        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                        let filename = format!("{}_edited_{}.csv", table_name, timestamp);
-                        self.write_csv_data(&data, &filename)?;
-                        self.data_modified = false;
-                        self.status_message = Some(format!(
-                            "Changes exported to {} (SQLite direct save not supported)",
-                            filename
-                        ));
-                    }
-                    crate::data_source::DataSource::Parquet(_, _) => {
-                        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                        let filename = format!("{}_edited_{}.csv", table_name, timestamp);
-                        self.write_csv_data(&data, &filename)?;
-                        self.data_modified = false;
-                        self.status_message = Some(format!(
-                            "Changes saved to {} (converted from Parquet)",
-                            filename
-                        ));
+                    Err(e) => {
+                        // Fallback to export behavior for SQLite and unsupported operations
+                        if matches!(data_source, crate::data_source::DataSource::Sqlite(_)) {
+                            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                            let filename = format!("{}_exported_{}.csv", table_name, timestamp);
+                            self.write_csv_data(&data, &filename)?;
+                            self.data_modified = false;
+                            self.status_message = Some(format!(
+                                "Changes exported to {} (SQLite direct save not supported)", 
+                                filename
+                            ));
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -886,7 +910,7 @@ impl AppState {
     fn handle_computed_column_input(
         &mut self,
         key_event: KeyEvent,
-        data_source: &DataSource,
+        data_source: &mut DataSource,
     ) -> Result<bool> {
         match key_event.code {
             KeyCode::Esc => {
@@ -900,7 +924,7 @@ impl AppState {
                             self.apply_computed_columns(data_source)?;
                             // Save computed columns to persistence
                             if let Some(table_name) = self.current_table() {
-                                if let Err(e) = self.save_computed_columns(table_name) {
+                                if let Err(e) = self.save_computed_columns(table_name, data_source) {
                                     self.status_message =
                                         Some(format!("Column added but save failed: {}", e));
                                 } else {

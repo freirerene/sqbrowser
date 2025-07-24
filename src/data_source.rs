@@ -7,7 +7,7 @@ use crate::file_reader::{detect_file_type, read_csv_file, read_xlsx_file, read_p
 pub enum DataSource {
     Sqlite(Database),
     Csv(QueryResult, PathBuf),  // Store original path for SQL queries
-    Xlsx(Vec<(String, QueryResult)>),
+    Xlsx(Vec<(String, QueryResult)>, PathBuf),  // Store original path
     Parquet(QueryResult, PathBuf),  // Store original path for SQL queries
 }
 
@@ -26,7 +26,7 @@ impl DataSource {
             }
             FileType::Xlsx => {
                 let sheets = read_xlsx_file(&path)?;
-                Ok(DataSource::Xlsx(sheets))
+                Ok(DataSource::Xlsx(sheets, path))
             }
             FileType::Parquet => {
                 let data = read_parquet_file(&path)?;
@@ -39,7 +39,7 @@ impl DataSource {
         match self {
             DataSource::Sqlite(db) => db.get_tables(),
             DataSource::Csv(_, _) => Ok(vec!["CSV Data".to_string()]),
-            DataSource::Xlsx(sheets) => Ok(sheets.iter().map(|(name, _)| name.clone()).collect()),
+            DataSource::Xlsx(sheets, _) => Ok(sheets.iter().map(|(name, _)| name.clone()).collect()),
             DataSource::Parquet(_, _) => Ok(vec!["Parquet Data".to_string()]),
         }
     }
@@ -48,7 +48,7 @@ impl DataSource {
         match self {
             DataSource::Sqlite(db) => db.get_table_data(table_name, offset, limit),
             DataSource::Csv(data, _) => Ok(paginate_data(data, offset, limit)),
-            DataSource::Xlsx(sheets) => {
+            DataSource::Xlsx(sheets, _) => {
                 if let Some((_, sheet_data)) = sheets.iter().find(|(name, _)| name == table_name) {
                     Ok(paginate_data(sheet_data, offset, limit))
                 } else {
@@ -76,7 +76,7 @@ impl DataSource {
                     Err(anyhow::anyhow!("Only SELECT queries are supported for CSV files"))
                 }
             }
-            DataSource::Xlsx(sheets) => {
+            DataSource::Xlsx(sheets, _) => {
                 if let Some((_, sheet_data)) = sheets.iter().find(|(name, _)| name == table_name) {
                     // Similar limitation for XLSX - DataFusion doesn't support Excel directly
                     if query.to_uppercase().contains("SELECT") {
@@ -111,7 +111,7 @@ impl DataSource {
                 self.write_csv_data(data, filename)?;
                 Ok(data.total_rows)
             }
-            DataSource::Xlsx(sheets) => {
+            DataSource::Xlsx(sheets, _) => {
                 if let Some((_, sheet_data)) = sheets.iter().find(|(name, _)| name == table_name) {
                     self.write_csv_data(sheet_data, filename)?;
                     Ok(sheet_data.total_rows)
@@ -133,12 +133,114 @@ impl DataSource {
                 self.write_csv_data(data, filename)?;
                 Ok(data.total_rows)
             }
-            DataSource::Xlsx(_) => {
+            DataSource::Xlsx(_, _) => {
                 Err(anyhow::anyhow!("Query export not supported for XLSX files"))
             }
             DataSource::Parquet(data, _) => {
                 self.write_csv_data(data, filename)?;
                 Ok(data.total_rows)
+            }
+        }
+    }
+
+    pub fn save_table_data(&self, table_name: &str, data: &QueryResult) -> Result<()> {
+        match self {
+            DataSource::Sqlite(_) => {
+                Err(anyhow::anyhow!("Direct SQLite table saving not implemented yet"))
+            }
+            DataSource::Csv(_, path) => {
+                self.write_csv_data(data, &path.to_string_lossy())?;
+                Ok(())
+            }
+            DataSource::Xlsx(_, path) => {
+                // Convert original Excel file path to CSV
+                let csv_path = path.with_extension("csv");
+                self.write_csv_data(data, &csv_path.to_string_lossy())?;
+                Ok(())
+            }
+            DataSource::Parquet(_, path) => {
+                // Convert original Parquet file path to CSV
+                let csv_path = path.with_extension("csv");
+                self.write_csv_data(data, &csv_path.to_string_lossy())?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn get_original_file_path(&self) -> Option<PathBuf> {
+        match self {
+            DataSource::Sqlite(db) => None, // Database doesn't have a simple file path in this context
+            DataSource::Csv(_, path) => Some(path.clone()),
+            DataSource::Xlsx(_, path) => Some(path.clone()),
+            DataSource::Parquet(_, path) => Some(path.clone()),
+        }
+    }
+
+    /// Get the effective file path where data will be saved (considering format conversions)
+    pub fn get_effective_save_path(&self) -> Option<PathBuf> {
+        match self {
+            DataSource::Sqlite(_) => None, // SQLite doesn't save to files directly
+            DataSource::Csv(_, path) => Some(path.clone()),
+            DataSource::Xlsx(_, path) => Some(path.with_extension("csv")), // Excel saves as CSV
+            DataSource::Parquet(_, path) => Some(path.with_extension("csv")), // Parquet saves as CSV
+        }
+    }
+
+    /// Reload the data from the current file (to reflect saved changes)
+    pub fn reload_data(&mut self) -> Result<()> {
+        match self {
+            DataSource::Sqlite(_) => {
+                // SQLite doesn't need reloading since it reads from the database directly
+                Ok(())
+            }
+            DataSource::Csv(data, path) => {
+                // Check if the file was converted to CSV (original was Excel/Parquet)
+                let effective_path = path.clone();
+                if effective_path.extension().and_then(|s| s.to_str()) != Some("csv") {
+                    // File was originally non-CSV, check if CSV version exists
+                    let csv_path = effective_path.with_extension("csv");
+                    if csv_path.exists() {
+                        // Load from the converted CSV file
+                        *data = read_csv_file(&csv_path)?;
+                        // Update the path to point to the CSV file for future operations
+                        *path = csv_path;
+                    } else {
+                        // Reload original CSV
+                        *data = read_csv_file(path)?;
+                    }
+                } else {
+                    // Reload original CSV
+                    *data = read_csv_file(path)?;
+                }
+                Ok(())
+            }
+            DataSource::Xlsx(sheets, path) => {
+                // Check if a CSV version was created
+                let csv_path = path.with_extension("csv");
+                if csv_path.exists() {
+                    // Convert to CSV DataSource since the file was saved as CSV
+                    let csv_data = read_csv_file(&csv_path)?;
+                    // This is a bit tricky - we need to replace ourselves with a CSV DataSource
+                    // For now, we'll update the sheets to contain the CSV data
+                    sheets.clear();
+                    sheets.push(("CSV Data".to_string(), csv_data));
+                } else {
+                    // Reload original Excel file
+                    *sheets = read_xlsx_file(path)?;
+                }
+                Ok(())
+            }
+            DataSource::Parquet(data, path) => {
+                // Check if a CSV version was created
+                let csv_path = path.with_extension("csv");
+                if csv_path.exists() {
+                    // Load from the converted CSV file
+                    *data = read_csv_file(&csv_path)?;
+                } else {
+                    // Reload original Parquet file
+                    *data = read_parquet_file(path)?;
+                }
+                Ok(())
             }
         }
     }
