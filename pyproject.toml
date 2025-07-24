@@ -1,7 +1,0 @@
-[project]
-name = "sqbrowser"
-version = "0.1.0"
-description = "Simple script to browse tables from a sqlite database."
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = ["keyboard>=0.13.5", "rich>=14.0.0"]
