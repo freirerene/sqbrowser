@@ -3,6 +3,7 @@ mod file_reader;
 mod data_source;
 mod ui;
 mod config;
+mod persistence;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
     let mut app = AppState::new(
         args.file.to_string_lossy().to_string(),
         tables
-    );
+    )?;
 
     // Load initial data
     app.load_current_data(&data_source)?;

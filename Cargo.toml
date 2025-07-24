@@ -2,7 +2,7 @@
 name = "sqbrowser"
 version = "0.1.0"
 edition = "2021"
-description = "Simple SQLite database browser with TUI interface"
+description = "Simple SQLite and tables browser."
 
 [[bin]]
 name = "sqbrowser"

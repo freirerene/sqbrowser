@@ -1,0 +1,32 @@
+{
+  "colors": {
+    "border": "#bac2deff",
+    "text": "#cdd6f4ff",
+    "number": "#fab387ff",
+    "selected_border": "#cba6f7ff",
+    "selected_text": "#1e1e2eff",
+    "selected_bg": "#cba6f7ff",
+    "edit_border": "#89b4faff",
+    "edit_text": "#cdd6f4ff",
+    "edit_bg": "#89b4faff",
+    "header": "#94e2d5ff",
+    "status": "#a6e3a1ff",
+    "error": "#f38ba8ff",
+    "help": "#bac2deff",
+    "help_bg": "#1e1e2eff",
+    "help_title": "#f9e2afff",
+    "help_section_header": "#f5c2e7ff",
+    "help_key": "#cba6f7ff",
+    "help_description": "#cdd6f4ff",
+    "column_header": "#f5e0dcff",
+    "query_bg": "#313244ff",
+    "query_text": "#cdd6f4ff",
+    "query_border": "#89b4faff",
+    "edit_area_bg": "#45475aff",
+    "detailed_view_bg": "#1e1e2eff",
+    "detailed_view_border": "#f9e2afff",
+    "detailed_view_title": "#f9e2afff",
+    "detailed_view_field": "#89b4faff",
+    "detailed_view_value": "#cdd6f4ff"
+  }
+}
