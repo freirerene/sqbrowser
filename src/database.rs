@@ -75,7 +75,15 @@ impl Database {
     ) -> Result<QueryResult> {
         // Include rowid for update operations
         let query = format!("SELECT rowid, * FROM {} LIMIT {} OFFSET {}", table_name, limit, offset);
-        self.execute_query(&query)
+        let mut result = self.execute_query(&query)?;
+        
+        // Get the actual total row count for the table
+        let count_query = format!("SELECT COUNT(*) FROM {}", table_name);
+        let mut stmt = self.conn.prepare(&count_query)?;
+        let total_rows: i64 = stmt.query_row([], |row| row.get(0))?;
+        result.total_rows = total_rows as usize;
+        
+        Ok(result)
     }
 
     pub fn execute_query(&self, query: &str) -> Result<QueryResult> {
